@@ -1,2 +1,6 @@
-Bla bla bla, this is a dashboard.
-
+streamlit
+pandas
+numpy
+matplotlib
+sqlalchemy
+psycopg2-binary
