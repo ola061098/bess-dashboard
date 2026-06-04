@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 from sqlalchemy import text
 from config import get_engine
-from Dispatcher import load_prices, run_backtest, optimize_day, BATTERY
+from Dispatcher import load_prices, run_backtest, optimize_day
 
 st.set_page_config(page_title="BESS Dashboard", layout="wide")
 st.title("BESS Analytics Dashboard")
@@ -35,17 +35,22 @@ def _wind_forecast_df():
 
 
 @st.cache_data(ttl=3600)
-def _dispatch_5d():
+def _dispatch_5d(capacity, efficiency, max_cycles, soc_min, soc_max):
     df = _prices()
     cutoff = pd.Timestamp.now() - pd.Timedelta(days=5)
     last5 = df[df["datetime"] >= cutoff].copy()
-    return last5, run_backtest(last5, BATTERY)
+    battery = {
+        "capacity_mwh": capacity, "efficiency": efficiency,
+        "max_cycles_per_day": max_cycles,
+        "soc_min_pct": soc_min / 100, "soc_max_pct": soc_max / 100,
+    }
+    return last5, run_backtest(last5, battery)
 
 
-def _daily_detail(week_df, label):
+def _daily_detail(week_df, label, capacity, efficiency, max_cycles, soc_min, soc_max):
     rows = []
     for date, group in week_df.groupby(week_df["datetime"].dt.date):
-        profit, _ = optimize_day(group["price_eur_mwh"].tolist(), 100, 0.9, 2, 10, 90, 0)
+        profit, _ = optimize_day(group["price_eur_mwh"].tolist(), capacity, efficiency, max_cycles, soc_min, soc_max, 0)
         rows.append({
             "Week": label,
             "Date": date,
@@ -62,7 +67,7 @@ def _daily_detail(week_df, label):
 
 
 @st.cache_data(ttl=3600)
-def _weekly_computation():
+def _weekly_computation(capacity, efficiency, max_cycles, soc_min, soc_max):
     df = _prices()
     max_date = pd.Timestamp(df["datetime"].max().date())
     days_since_friday = (max_date.weekday() - 4) % 7
@@ -83,8 +88,8 @@ def _weekly_computation():
     last_label = f"Last Week ({last_mon.date()} - {last_fri.date()})"
     prev_label = f"Prev Week ({prev_mon.date()} - {prev_fri.date()})"
 
-    last_daily = _daily_detail(last_wk, last_label)
-    prev_daily = _daily_detail(prev_wk, prev_label)
+    last_daily = _daily_detail(last_wk, last_label, capacity, efficiency, max_cycles, soc_min, soc_max)
+    prev_daily = _daily_detail(prev_wk, prev_label, capacity, efficiency, max_cycles, soc_min, soc_max)
 
     both = pd.concat([prev_wk, last_wk]).sort_values("datetime")
     last_dates = set(last_wk["datetime"].dt.date.unique())
@@ -94,7 +99,7 @@ def _weekly_computation():
         prices = group["price_eur_mwh"].tolist()
         date = group["datetime"].dt.date.iloc[0]
         is_last = date in last_dates
-        _, schedule = optimize_day(prices, 100, 0.9, 2, 10, 90, 0)
+        _, schedule = optimize_day(prices, capacity, efficiency, max_cycles, soc_min, soc_max, 0)
         for idx, action in schedule:
             if action == "Charge":
                 (lw_c if is_last else pw_c).append((datetimes[idx], prices[idx]))
@@ -104,6 +109,25 @@ def _weekly_computation():
     return (last_mon, last_fri, prev_mon, prev_fri,
             last_label, prev_label, last_daily, prev_daily, both,
             lw_c, lw_d, pw_c, pw_d)
+
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("Battery Parameters")
+    capacity    = st.slider("Capacity (MWh)",          min_value=10,  max_value=500, value=100, step=10)
+    efficiency  = st.slider("Round-trip Efficiency",   min_value=0.5, max_value=1.0, value=0.9, step=0.01)
+    max_cycles  = st.slider("Max Cycles / Day",        min_value=1,   max_value=5,   value=2,   step=1)
+    soc_min     = st.slider("Min SoC (%)",             min_value=0,   max_value=40,  value=10,  step=5)
+    soc_max     = st.slider("Max SoC (%)",             min_value=60,  max_value=100, value=90,  step=5)
+
+    battery_cfg = {
+        "capacity_mwh":       capacity,
+        "efficiency":         efficiency,
+        "max_cycles_per_day": max_cycles,
+        "soc_min_pct":        soc_min / 100,
+        "soc_max_pct":        soc_max / 100,
+    }
 
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
@@ -139,8 +163,8 @@ with tab1:
     db_wind  = day_before["wind_generation"].sum()
     db_solar = day_before["solar_generation"].sum()
 
-    profit_y,  _ = optimize_day(yesterday["price_eur_mwh"].tolist(),  100, 0.9, 2, 10, 90, 0)
-    profit_db, _ = optimize_day(day_before["price_eur_mwh"].tolist(), 100, 0.9, 2, 10, 90, 0)
+    profit_y,  _ = optimize_day(yesterday["price_eur_mwh"].tolist(),  capacity, efficiency, max_cycles, soc_min, soc_max, 0)
+    profit_db, _ = optimize_day(day_before["price_eur_mwh"].tolist(), capacity, efficiency, max_cycles, soc_min, soc_max, 0)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Avg Price",        f"{y_avg:.2f} EUR/MWh",   f"{y_avg - db_avg:+.2f} vs prev day")
@@ -192,7 +216,7 @@ with tab1:
 
 with tab2:
     st.header("BESS Dispatch - Last 5 Days")
-    last5, dispatch = _dispatch_5d()
+    last5, dispatch = _dispatch_5d(capacity, efficiency, max_cycles, soc_min, soc_max)
 
     charges    = dispatch[dispatch["action"] == "Charge"]
     discharges = dispatch[dispatch["action"] == "Discharge"]
@@ -320,7 +344,7 @@ with tab4:
     with st.spinner("Computing weekly BESS dispatch..."):
         (last_mon, last_fri, prev_mon, prev_fri,
          last_label, prev_label, last_daily, prev_daily, both_wks,
-         lw_c, lw_d, pw_c, pw_d) = _weekly_computation()
+         lw_c, lw_d, pw_c, pw_d) = _weekly_computation(capacity, efficiency, max_cycles, soc_min, soc_max)
 
     def _summary_row(label, period, daily_df, week_df):
         best  = daily_df.loc[daily_df["BESS Optimal P&L [EUR]"].idxmax()]
@@ -450,33 +474,6 @@ with tab5:
         use_container_width=True
     )
 
-    # --- Plot correlation plot between prices_eur_mwh and solar/wind forecast error ---
-    # for each week on a lowest granularity(15 min) ---
-    def prices_eur_mwh_forecast_solar_wind_correlation(df, solar_forecast_df, wind_forecast_df):
-        plt.figure(figsize(14,6))
-        prices = df["prices_eur_mwh"]
-        solar_error = solar_forecast_df["error_mwh"]
-        wind_error = wind_forecast_df["error_mwh"]
-        
-        plt.scatter(prices, solar_error, alpha=0.5, label="Solar Error")
-        plt.scatter(prices, wind_error, alpha=0.5, label="Wind Error")
-        plt.xlabel("Prices [EUR/MWh]")
-        plt.ylabel("Forecast Error [MWh]")
-        plt.title("Correlation between Prices and Forecast Error")
-        corr_solar = df["prices_eur_mwh"].corr(solar_forecast_df["error_mwh"])
-        corr_wind = df["prices_eur_mwh"].corr(wind_forecast_df["error_mwh"])
-        plt.text(0.5, 0.9, f"Solar Correlation: {corr_solar:.2f}", transform=plt.gca().transAxes)
-        plt.text(0.5, 0.85, f"Wind Correlation: {corr_wind:.2f}", transform=plt.gca().transAxes)
-        plt.legend()
-        plt.grid(True)
-        plt.show()  
-
-        df_result = pd.DataFrame({
-            "Prices [EUR/MWh]": prices,
-            "Solar Error [MWh]": solar_error,
-            "Wind Error [MWh]": wind_error
-        })
-        
     buf_wf = BytesIO()
     with pd.ExcelWriter(buf_wf, engine="xlsxwriter") as writer:
         wf.to_excel(writer,       sheet_name="Data",    index=False)
